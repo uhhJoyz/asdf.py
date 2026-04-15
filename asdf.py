@@ -1,7 +1,13 @@
 """
-Use of generative AI disclosure: Generative AI was used in compliance with course policy to both create and verify regexes which extract the metadata from files. Note that, before regexes were included in the code, they were thoroughly reviewed to ensure proper functionality in accordance with our specifications.
+Use of generative AI disclosure: Generative AI was used in compliance with
+course policy to both create and verify regexes which extract the metadata from
+files. Note that, before regexes were included in the code, they were
+thoroughly reviewed to ensure proper functionality in accordance with our
+specifications.
 
-All code in this file is hand-written and formatted with the *black* Python formatter. Even regexes which were AI-generated were hand-written to ensure proper understanding of their function.
+All code in this file is hand-written and formatted with the *black* Python
+formatter. Even regexes which were AI-generated were hand-written to ensure
+proper understanding of their function.
 """
 
 import os
@@ -11,8 +17,6 @@ PID = os.getpid()
 
 # must be an absolute path, so we have to resolve it
 dump_dir = Path(f"./temp_{PID}").resolve()
-dump_dir.mkdir(parents=True, exist_ok=True)
-assert dump_dir.is_dir() and os.access(dump_dir, os.W_OK)
 
 # set the dump directory for JAX to dump MLIR from XLA as text
 os.environ["XLA_FLAGS"] = f"--xla_dump_hlo_as_text --xla_dump_to={dump_dir}"
@@ -25,7 +29,8 @@ import jax
 from torch.profiler import profile, ProfilerActivity
 from static_analyzer import gather_stats, get_asdf, serialize_stats, get_csv_header
 
-def load_function_from_file(file: Path, function_name: str, debug: bool=False):
+
+def load_function_from_file(file: Path, function_name: str, debug: bool = False):
     module_name = file.stem
     spec = importlib.util.spec_from_file_location(module_name, file)
     if spec is None or spec.loader is None:
@@ -48,17 +53,57 @@ def load_function_from_file(file: Path, function_name: str, debug: bool=False):
 
     return f
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--torch_file", type=Path, help="Path to PyTorch program which needs to be profiled.")
-    parser.add_argument("-f", "--torch_fn", type=str, help="Name of function to load from provided PyTorch file.")
-    parser.add_argument("-j", "--jax_file", type=Path, help="Path to JAX program which needs to be profiled.")
-    parser.add_argument("-g", "--jax_fn", type=str, help="Name of function to load from provided JAX file.")
-    parser.add_argument("-x", "--torch_ig_fn", type=str, help="Input generation function name for passed PyTorch function (assumed as get_inputs).")
-    parser.add_argument("-y", "--jax_ig_fn", type=str, help="Input generation function name for passed JAX function (assumed as get_inputs).")
-    parser.add_argument("-d", "--debug", action="store_true", help="Debug flag for debugging file loading.")
-    parser.add_argument("-s", "--save", action="store_true", help="Save dumped XLA after parsing.")
-    parser.add_argument("-o", "--output", type=Path, help="Set the output file (should be a csv).")
+    parser.add_argument(
+        "-t",
+        "--torch_file",
+        type=Path,
+        help="Path to PyTorch program which needs to be profiled.",
+    )
+    parser.add_argument(
+        "-f",
+        "--torch_fn",
+        type=str,
+        help="Name of function to load from provided PyTorch file.",
+    )
+    parser.add_argument(
+        "-j",
+        "--jax_file",
+        type=Path,
+        help="Path to JAX program which needs to be profiled.",
+    )
+    parser.add_argument(
+        "-g",
+        "--jax_fn",
+        type=str,
+        help="Name of function to load from provided JAX file.",
+    )
+    parser.add_argument(
+        "-x",
+        "--torch_ig_fn",
+        type=str,
+        help="Input generation function name for passed PyTorch function (assumed as get_inputs).",
+    )
+    parser.add_argument(
+        "-y",
+        "--jax_ig_fn",
+        type=str,
+        help="Input generation function name for passed JAX function (assumed as get_inputs).",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Debug flag for debugging file loading.",
+    )
+    parser.add_argument(
+        "-s", "--save", action="store_true", help="Save dumped XLA after parsing."
+    )
+    parser.add_argument(
+        "-o", "--output", type=Path, help="Set the output file (should be a csv)."
+    )
 
     args = parser.parse_args()
 
@@ -74,27 +119,29 @@ if __name__ == "__main__":
             get_inputs = load_function_from_file(args.torch_file, input_function_name)
         except _:
             raise RuntimeException(
-                                   "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
-                                   )
+                "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
+            )
         # safety in case the target file does not do this already
-        torch.set_default_device('cuda')
+        torch.set_default_device("cuda")
         if debug:
             print("CUDA available (torch):", torch.cuda.is_available())
             print("Current CUDA Device (torch):", torch.cuda.current_device())
 
         # compile the function
-        torch_fn = torch.compile(fn, options={"triton.cudagraphs": True}, fullgraph=True)
+        torch_fn = torch.compile(
+            fn, options={"triton.cudagraphs": True}, fullgraph=True
+        )
 
         # run the function once before profiling to be safe
         torch_fn(*(get_inputs()))
         torch.cuda.synchronize()
 
         with profile(
-                 activities=[ProfilerActivity.CUDA],
-                 record_shapes=False,
-                 profile_memory=False,
-                 acc_events=True,
-                 ) as prof:
+            activities=[ProfilerActivity.CUDA],
+            record_shapes=False,
+            profile_memory=False,
+            acc_events=True,
+        ) as prof:
             # unpack the inputs into the function input
             torch_fn(*(get_inputs()))
             torch.cuda.synchronize()
@@ -108,6 +155,9 @@ if __name__ == "__main__":
             print(f"PyTorch kernel launches: {num_kernel_launches}")
 
     if args.jax_file:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        assert dump_dir.is_dir() and os.access(dump_dir, os.W_OK)
+
         function_name = args.jax_fn if args.jax_fn else "main"
         fn = load_function_from_file(args.jax_file, function_name)
 
@@ -117,10 +167,12 @@ if __name__ == "__main__":
             get_inputs = load_function_from_file(args.jax_file, input_function_name)
         except _:
             raise RuntimeException(
-                                   "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
-                                   )
+                "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
+            )
         if debug:
-            print("CUDA available (JAX):", any(d.platform == "gpu" for d in jax.devices()))
+            print(
+                "CUDA available (JAX):", any(d.platform == "gpu" for d in jax.devices())
+            )
             print("Available devices (JAX):", jax.devices())
 
         # compile the function
@@ -128,8 +180,12 @@ if __name__ == "__main__":
 
         # run the function to dump XLA compilation at the lowest level
         jax_fn(*(get_inputs())).block_until_ready()
-        dumps = [dump_dir / Path(d) for d in os.listdir(dump_dir) if d.startswith(f"jit_{args.jax_fn}")]
-       
+        dumps = [
+            dump_dir / Path(d)
+            for d in os.listdir(dump_dir)
+            if d.startswith(f"jit_{args.jax_fn}")
+        ]
+
         stats = gather_stats(dumps, debug=True)
 
         if not args.save:

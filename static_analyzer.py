@@ -1,7 +1,13 @@
 """
-Use of generative AI disclosure: Generative AI was used in compliance with course policy to both create and verify regexes which extract the metadata from files. Note that, before regexes were included in the code, they were thoroughly reviewed to ensure proper functionality in accordance with our specifications.
+Use of generative AI disclosure: Generative AI was used in compliance with
+course policy to both create and verify regexes which extract the metadata from
+files. Note that, before regexes were included in the code, they were
+thoroughly reviewed to ensure proper functionality in accordance with our
+specifications.
 
-All code in this file is hand-written and formatted with the *black* Python formatter. Even regexes which were AI-generated were hand-written to ensure proper understanding of their function.
+All code in this file is hand-written and formatted with the *black* Python
+formatter. Even regexes which were AI-generated were hand-written to ensure
+proper understanding of their function.
 """
 
 import argparse
@@ -137,11 +143,11 @@ def serialize_stats(fs: FunctionStats, sep: str = ";") -> str:
         f"{fs.arith_int}{sep}"
         f"{fs.asdf}{sep}"
         f"{fs.torch_asdf}"
-        )
+    )
+
 
 def get_csv_header(sep: str = ";"):
     return (
-        
         f"Name{sep}"
         f"Input Tensors{sep}"
         f"Output Tensors{sep}"
@@ -291,7 +297,7 @@ def fmt_operations(n: int) -> str:
     return f"{n} ops"
 
 
-def gather_stats(dirs: list[Path], debug: bool = False):
+def gather_stats(dirs: list[Path], debug: bool = True):
     stats: list[FunctionStats] = []
     for dir in dirs:
         all_stats: list[FunctionStats] = get_stats(dir)
