@@ -129,8 +129,9 @@ class FunctionStats:
     torch_asdf: float = 0
 
 
-def serialize_stats(fs: FunctionStats, sep: str = ";") -> str:
+def serialize_stats(fs: FunctionStats, file: str | Path = "", sep: str = ";") -> str:
     return (
+        f"{file}{sep}"
         f"{fs.name}{sep}"
         f"{fs.input_tensors}{sep}"
         f"{fs.output_tensors}{sep}"
@@ -148,6 +149,7 @@ def serialize_stats(fs: FunctionStats, sep: str = ";") -> str:
 
 def get_csv_header(sep: str = ";"):
     return (
+        f"File{sep}"
         f"Name{sep}"
         f"Input Tensors{sep}"
         f"Output Tensors{sep}"

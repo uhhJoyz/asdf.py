@@ -213,7 +213,7 @@ if __name__ == "__main__":
                 for stat in stat_list:
                     if args.output.is_file():
                         with open(args.output, "a") as f:
-                            f.write(serialize_stats(stat, ";") + "\n")
+                            f.write(serialize_stats(stat, os.path.basename(args.jax_file), ";") + "\n")
                     else:
                         with open(args.output, "a") as f:
                             f.write(get_csv_header() + "\n")
