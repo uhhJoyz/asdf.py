@@ -140,9 +140,9 @@ def serialize_stats(fs: FunctionStats, sep: str = ";") -> str:
         f"{fs.compute_ops}{sep}"
         f"{fs.external_calls}{sep}"
         f"{fs.unique_ops}{sep}"
-        f"{fs.arith_int}{sep}"
-        f"{fs.asdf}{sep}"
-        f"{fs.torch_asdf}"
+        f"{round(fs.arith_int, 4)}{sep}"
+        f"{round(fs.asdf, 4)}{sep}"
+        f"{round(fs.torch_asdf, 4)}"
     )
 
 

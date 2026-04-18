@@ -30,6 +30,18 @@ from torch.profiler import profile, ProfilerActivity
 from static_analyzer import gather_stats, get_asdf, serialize_stats, get_csv_header
 
 
+# a helper function to delete files because
+# there is not one in python's os module
+# and rmdir will fail if the dir is not empty
+def recursive_deletion(file: Path):
+    if file.is_dir():
+        for f in os.listdir(file):
+            recursive_deletion(file / Path(f))
+        os.rmdir(file)
+    else:
+        os.remove(file)
+    
+
 def load_function_from_file(file: Path, function_name: str, debug: bool = False):
     module_name = file.stem
     spec = importlib.util.spec_from_file_location(module_name, file)
@@ -188,11 +200,6 @@ if __name__ == "__main__":
 
         stats = gather_stats(dumps, debug=True)
 
-        if not args.save:
-            os.rmdir(dump_dir)
-        else:
-            os.rename(os.path.basename(dump_dir), f"saved_asdf_{args.jax_fn}_{PID}")
-
         if num_kernel_launches:
             for stat_list in stats:
                 for stat in stat_list:
@@ -211,3 +218,8 @@ if __name__ == "__main__":
                         with open(args.output, "a") as f:
                             f.write(get_csv_header() + "\n")
                             f.write(serialize_stats(stat, ";") + "\n")
+
+        if not args.save:
+            recursive_deletion(dump_dir)
+        else:
+            os.rename(os.path.basename(dump_dir), f"saved_asdf_{args.jax_fn}_{PID}")
