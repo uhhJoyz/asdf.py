@@ -19,25 +19,30 @@ from collections import defaultdict
 # list found here: https://docs.rs/xla/latest/xla/enum.PrimitiveType.html
 #     see also: https://openxla.org/stablehlo/spec
 DTYPE_TO_BYTES: dict[str, int] = {
-    # some types (shown below) are unsupported because we
-    # did not find a reliable source documenting their size
-    # "complex<f64>": 16, ?
-    # "complex<f32>": 8, ?
-    # we also don't have support for tuples as they are relatively uncommon in the performance domains we are interested
+    # some types are unsupported because we did not find a reliable source
+    # documenting their size we also don't have support for tuples as they
+    # are relatively uncommon in the performance domains we are interested in
+    "c128": 16,
+    "s64": 8,
     "f64": 8,
     "i64": 8,
     "ui64": 8,
+    "c64": 8,
+    "s32": 4,
     "f32": 4,
     "i32": 4,
     "ui32": 4,
     "f16": 2,
     "i16": 2,
-    "ui16": 2,
+    "s16": 2,
+    "u16": 2,
     "bf16": 2,
+    "s8": 1,
     "i8": 1,
     "ui8": 1,
     "bf8": 1,
     "i1": 1,
+    "pred": 1,
 }
 
 # a (hopefully) exhaustive list of compute operations in XLA
@@ -86,8 +91,24 @@ COMPUTE_OPS: frozenset[str] = frozenset(
         "round_nearest_afz",
         "convert",
         "iota",
+        "exponential",
+        "dot",
+        "dot_general",
+        "reduce",
     }
 )
+
+
+HLO_STAGE_PATTERNS: list[tuple[str, str]] = [
+    ("before_optimizations", ".before_optimizations.txt"),
+    ("after_spmd_partitioner", ".after_spmd_partitioner.txt"),
+    ("after_optimizations", ".sm_*_gpu_after_optimizations.txt"),
+]
+
+ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:ROOT\s+)?%(?P<name>[\w.]+)\s*=\s*(?P<type>\S+)\s+(?P<op>\w+)\((?P<args>[^)]*)\)"
+)
+FUSION_META_RE = re.compile(r"kind\s*=\s*(?P<kind>\w+).*?calls\s*=\s*%(?P<callee>\w+)")
 
 
 def get_tensor_size_and_type(type_str: str) -> tuple[int, str]:
@@ -110,6 +131,31 @@ def get_tensor_size_and_type(type_str: str) -> tuple[int, str]:
     return 0, ""
 
 
+def get_hlo_size_and_type(s: str) -> tuple[int, str]:
+    t = s.strip()
+    m = re.match(r"^(\w+)\[([^\]]+)\]", t)
+    if m:
+        dtype = m.group(1)
+        try:
+            dims = [int(d) for d in m.group(2).split(",")]
+        except ValueError:
+            return 0, ""
+        n = 1
+        for d in dims:
+            n *= d
+        return n, dtype
+    # in the scalar case
+    m = re.match(r"^(\w+)\[\]", t)
+    if m:
+        return 1, m.group(1)
+    return 0, ""
+
+
+def type_bytes(type_str: str) -> int:
+    n, dtype = get_hlo_size_and_type(type_str)
+    return n * DTYPE_TO_BYTES.get(dtype, 0)
+
+
 def is_scalar_tensor(type_str: str) -> bool:
     return bool(re.match(r"^tensor<[a-zA-Z]\w*>$", type_str.strip()))
 
@@ -128,6 +174,53 @@ class FunctionStats:
     asdf: float = 0
     torch_asdf: float = 0
 
+
+@dataclass
+class KernelStats:
+    name: str
+    kind: str
+    input_bytes: int = 0
+    output_bytes: int = 0
+    compute_ops: int = 0
+    unique_ops: set[str] = field(default_factory=set)
+
+    @property
+    def mem_bytes(self) -> int:
+        return self.input_bytes + self.output_bytes
+
+    @property
+    def arith_int(self) -> float:
+        return self.compute_ops / self.mem_bytes if self.mem_bytes > 0 else 0.0
+
+
+@dataclass
+class StageStats:
+    stage: str
+    path: Path
+    kernels: list[KernelStats] = field(default_factory=list)
+
+    @property
+    def total_compute_ops(self) -> int:
+        return sum(k.compute_ops for k in self.kernels)
+
+    @property
+    def total_mem_bytes(self) -> int:
+        return sum(k.mem_bytes for k in self.kernels)
+
+    @property
+    def overall_arith_int(self) -> float:
+        return (
+            self.total_compute_ops / self.total_mem_bytes
+            if self.total_mem_bytes > 0
+            else 0.0
+        )
+
+    def serialize(self, name: str, output_file: Path, delim: str = ";"):
+        return (
+            f"{name}{delim}{os.path.basename(self.path)}{delim}"
+            + f"{self.overall_arith_int}{delim}"
+        )
+        
 
 def serialize_stats(fs: FunctionStats, file: str | Path = "", sep: str = ";") -> str:
     return (
@@ -177,6 +270,20 @@ def find_body(text: str, start: int) -> int:
             depth_paren -= 1
         elif ch == "{" and depth_paren == 0:
             return i
+        i += 1
+    return -1
+
+
+def find_block_end(text: str, open_brace: int) -> int:
+    depth = 0
+    i = open_brace
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
         i += 1
     return -1
 
@@ -306,7 +413,7 @@ def gather_stats(dirs: list[Path], debug: bool = True):
         print(f"Gathering stats for directories: {dirs}")
     for dir in dirs:
         all_stats: list[FunctionStats] = get_stats(dir)
-        stats.append(all_stats)
+        stats += all_stats
 
         if len(all_stats) == 0:
             continue
@@ -364,6 +471,291 @@ def print_stats(dir: Path):
         print("--------------------------------")
 
 
+def extract_subcomputations(text: str) -> dict[str, str]:
+    subcomps: dict[str, str] = {}
+    header_re = re.compile(r"^%(?P<name>\w+)\s+\([^)]*\)\s*->[^{]+\{", re.MULTILINE)
+
+    for m in header_re.finditer(text):
+        pos = text.index("{", m.start())
+        end = find_block_end(text, pos)
+        if end != -1:
+            subcomps[m.group("name")] = text[pos + 1 : end]
+    return subcomps
+
+
+def count_body_ops(body: str) -> tuple[int, set[str]]:
+    total = 0
+    unique_ops: set[str] = set()
+    for line in body.splitlines():
+        m = ASSIGNMENT_RE.match(line)
+        if not m:
+            continue
+        op = m.group("op")
+        if op not in COMPUTE_OPS:
+            continue
+        n, _ = get_hlo_size_and_type(m.group("type"))
+        total += n
+        unique_ops.add(op)
+    return total, unique_ops
+
+
+def build_ssa_map(entry_body: str) -> dict[str, str]:
+    ssa: dict[str, str] = {}
+    for line in entry_body.splitlines():
+        m = ASSIGNMENT_RE.match(line)
+        if m:
+            ssa[m.group("name")] = m.group("type")
+    return ssa
+
+
+def input_bytes_for_args(args_str: str, ssa: dict[str, str]) -> int:
+    total = 0
+    for arg in re.findall(r"%[\w.]+", args_str):
+        name = arg.lstrip("%")
+        if name in ssa:
+            total += type_bytes(ssa[name])
+    return total
+
+
+def print_entry_stats(annotation: str, ks: KernelStats):
+    print(
+        f"flat op {ks.name} ({annotation}): "
+        f"in={fmt_bytes(ks.input_bytes)}, out={fmt_bytes(ks.output_bytes)}, "
+        f"ops={ks.compute_ops}, AI={ks.arith_int:.4f}"
+    )
+
+
+def parse_entry_flat(entry_body: str, debug: bool = False) -> list[KernelStats]:
+    ssa = build_ssa_map(entry_body)
+    kernels: list[KernelStats] = []
+
+    for line in entry_body.splitlines():
+        m = ASSIGNMENT_RE.match(line)
+        if not m:
+            continue
+        op = m.group("op")
+        if op not in COMPUTE_OPS:
+            continue
+
+        n, _ = get_hlo_size_and_type(m.group("type"))
+        out_b = type_bytes(m.group("type"))
+        in_b = input_bytes_for_args(m.group("args"), ssa)
+
+        ks = KernelStats(
+            name=m.group("name"),
+            kind="flat",
+            input_bytes=in_b,
+            output_bytes=out_b,
+            compute_ops=n,
+            unique_ops={op},
+        )
+        kernels.append(ks)
+
+        if debug:
+            print_entry_stats(f"{op}", ks)
+    return kernels
+
+
+def parse_entry_fused(
+    entry_body: str,
+    subcomps: dict[str, str],
+    debug: bool = False,
+) -> list[KernelStats]:
+    ssa = build_ssa_map(entry_body)
+    kernels: list[KernelStats] = []
+    for line in entry_body.splitlines():
+        m = ASSIGNMENT_RE.match(line)
+        if not m or m.group("op") != "fusion":
+            continue
+
+        fusion_meta = FUSION_META_RE.search(line)
+        if fusion_meta:
+            kind = fusion_meta.group("kind")
+            callee = fusion_meta.group("callee")
+        else:
+            kind = "unknown"
+            callee = ""
+        out_b = type_bytes(m.group("type"))
+        in_b = input_bytes_for_args(m.group("args"), ssa)
+
+        compute_ops = 0
+        unique_ops: set[str] = set()
+        if callee in subcomps:
+            compute_ops, unique_ops = count_body_ops(subcomps[callee])
+
+        ks = KernelStats(
+            name=m.group("name"),
+            kind=kind,
+            input_bytes=in_b,
+            output_bytes=out_b,
+            compute_ops=compute_ops,
+            unique_ops=unique_ops,
+        )
+
+        kernels.append(ks)
+
+        if debug:
+            print_entry_stats(f"calls %{callee}", ks)
+
+    return kernels
+
+
+def parse_hlo_file(path: Path, debug: bool = False) -> list[KernelStats]:
+    text = path.read_text()
+    subcomps = extract_subcomputations(text)
+
+    entry_m = re.search(r"\bENTRY\b[^{]*\{", text)
+    if not entry_m:
+        if debug:
+            print(f"WARNING: no entry found at {path.name}")
+        return []
+
+    pos = text.index("{", entry_m.start())
+    end = find_block_end(text, pos)
+
+    if end == -1:
+        if debug:
+            print(f"WARNING: unmatched brace in entry at {path.name}")
+        return []
+
+    entry_body = text[pos + 1 : end]
+    has_fusion = bool(re.search(r"\bfusion\b", entry_body))
+
+    if debug:
+        mode = "fused" if has_fusion else "flat"
+        print(f"parsing in {mode} mode at {path.name}")
+
+    if has_fusion:
+        return parse_entry_fused(entry_body, subcomps, debug=debug)
+    else:
+        return parse_entry_flat(entry_body, debug=debug)
+
+
+def find_hlo_stages(jit_subdir: Path, function_name: str) -> dict[str, Path]:
+    parent = jit_subdir.parent
+    stages: dict[str, Path] = {}
+
+    for label, suffix in HLO_STAGE_PATTERNS:
+        pattern = f"*.jit_{function_name}{suffix}"
+        matches = sorted(parent.glob(pattern))
+
+        if matches:
+            stages[label] = matches[0]
+
+    return stages
+
+
+def compare_stages(
+    jit_subdir: Path,
+    function_name: str,
+    debug: bool = False,
+) -> list[StageStats]:
+    stage_files = find_hlo_stages(jit_subdir, function_name)
+    results: list[StageStats] = []
+
+    for stage_label, path in stage_files.items():
+        if debug:
+            print(f"Parsing stage '{stage_label}': {path.name}")
+        kernels = parse_hlo_file(path, debug=debug)
+        results.append(StageStats(stage=stage_label, path=path, kernels=kernels))
+
+    return results
+
+
+def print_stage_comparison(stage_stats: list[StageStats]):
+    sep = "--------------------------------"
+
+    print(f"{sep}\nHLO Optimization Stage Comparisons\n{sep}")
+
+    for ss in stage_stats:
+        print(f"\nStage: {ss.stage}")
+        print(f"File: {ss.path.name}")
+        print(f"Num Kernels: {len(ss.kernels)}")
+        print(f"Total Compute Ops: {fmt_operations(ss.total_compute_ops)}")
+        print(f"Total Mem Bytes: {fmt_bytes(ss.total_mem_bytes)}")
+        print(f"Overall Arithmetic Intensity: {ss.overall_arith_int:.4f} ops/byte")
+
+        for k in ss.kernels:
+            print(
+                f"\t[{k.kind:8s}] {k.name}: "
+                + f"ops={fmt_operations(k.compute_ops)} "
+                + f"mem={fmt_bytes(k.mem_bytes)} "
+                + f"aint={k.arith_int:.4f}"
+            )
+            if k.unique_ops:
+                print(f"\t\tops in kernel: {sorted(k.unique_ops)}")
+
+    print(f"\n{sep}Fusion Benefit Summary{sep}")
+
+    before = next((s for s in stage_stats if s.stage == "before_optimizations"), None)
+    after = next((s for s in stage_stats if s.stage == "after_optimizations"), None)
+
+    if before and after:
+        print(
+            f"Virtual Kernel Count: {len(before.kernels):4d} -> {len(after.kernels):4d}"
+        )
+        print(
+            f"Overall Arithmetic Intensity (ops/byte): {before.overall_arith_int:.4f} -> {after.overall_arith_int:.4f}"
+        )
+
+        if before.overall_arith_int > 0:
+            ratio = after.overall_arith_int / before.overall_arith_int
+            print(f"ASDF: {ratio:.3f}x")
+    else:
+        if not before:
+            print("before_optimizations stage not found")
+        if not after:
+            print("after_optimizations stage not found")
+
+
+def opt_compare(dirs: list[Path], function_name: str = "kernel", debug: bool = False):
+    if any(not d.is_dir() for d in dirs):
+        raise RuntimeError("One or more of the passed arguments is not a directory.")
+    all_stats: list[StageStats] = []
+    for d in dirs:
+        stage_stats = compare_stages(d, function_name, debug=debug)
+
+        if debug:
+            if not stage_stats:
+                print(f"No HLO stage files found in directory {d}.")
+            else:
+                print_stage_comparison(stage_stats)
+        all_stats += stage_stats
+
+    return all_stats
+
+
+def cli_opt_compare(args: argparse.Namespace):
+    dirs = [Path(d) for d in args.directories]
+    if any(not d.is_dir() for d in dirs):
+        raise RuntimeError("One or more of the passed arguments is not a directory.")
+    if not args.function_name:
+        raise RuntimeError(
+            "Cannot perform optimization-level analysis without a passed function name."
+        )
+
+    for d in dirs:
+        stage_stats = compare_stages(d, args.function_name, debug=args.debug)
+
+        if not stage_stats:
+            print(f"No HLO stage files found in directory {d}.")
+        else:
+            print_stage_comparison(stage_stats)
+
+
+def functional_analysis(args: argparse.Namespace):
+    dirs = [Path(d) for d in args.directories]
+    for d in dirs:
+        if not d.is_dir() and not (d / "module.mlir").exists():
+            raise Exception(
+                f"Directory {str(d)} is not an MLIR module (does not contain module.mlir) and therefore cannot be parsed."
+            )
+        # for s in get_stats(d):
+        print_stats(d)
+
+    _ = gather_stats(dirs, True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Static analysis tool for analyzing StableHLO MLIR output at varying levels of lowering from XLA dumps of JAX-compiled functions.",
@@ -374,18 +766,24 @@ if __name__ == "__main__":
             "This will compare (pairwise) all of the passed directories' MLIR representations."
         ),
     )
-    parser.add_argument(
+    _ = parser.add_argument(
         "directories", nargs="+", help="Directories containing XLA dumps."
+    )
+    _ = parser.add_argument(
+        "-d", "--debug", action="store_true", help="Enable debug print statements."
+    )
+    _ = parser.add_argument(
+        "-o",
+        "--opt",
+        action="store_true",
+        help="Use the opmization stage analysis mode.",
+    )
+    _ = parser.add_argument(
+        "-f", "--function_name", type=str, help="Name of JAX function."
     )
 
     args = parser.parse_args()
-    dirs = [Path(d) for d in args.directories]
-    for d in dirs:
-        if not d.is_dir() and not (d / "module.mlir").exists():
-            raise Exception(
-                f"Directory {str(d)} is not an MLIR module (does not contain module.mlir) and therefore cannot be parsed."
-            )
-        # for s in get_stats(d):
-        print_stats(d)
-
-    gather_stats(dirs)
+    if args.opt:
+        cli_opt_compare(args)
+    else:
+        functional_analysis(args)

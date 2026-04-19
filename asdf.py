@@ -27,7 +27,7 @@ import sys
 import torch
 import jax
 from torch.profiler import profile, ProfilerActivity
-from static_analyzer import gather_stats, get_asdf, serialize_stats, get_csv_header
+from static_analyzer import gather_stats, get_asdf, serialize_stats, get_csv_header, opt_compare
 
 
 # a helper function to delete files because
@@ -40,7 +40,7 @@ def recursive_deletion(file: Path):
         os.rmdir(file)
     else:
         os.remove(file)
-    
+
 
 def load_function_from_file(file: Path, function_name: str, debug: bool = False):
     module_name = file.stem
@@ -69,46 +69,28 @@ def load_function_from_file(file: Path, function_name: str, debug: bool = False)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-t",
-        "--torch_file",
-        type=Path,
-        help="Path to PyTorch program which needs to be profiled.",
-    )
-    parser.add_argument(
-        "-f",
-        "--torch_fn",
-        type=str,
-        help="Name of function to load from provided PyTorch file (assumed as 'kernel' unless otherwise specified).",
-    )
-    parser.add_argument(
         "-j",
         "--jax_file",
         type=Path,
         help="Path to JAX program which needs to be profiled.",
     )
     parser.add_argument(
-        "-g",
+        "-f",
         "--jax_fn",
         type=str,
         help="Name of function to load from provided JAX file (assumed as 'kernel' unless otherwise specified).",
     )
     parser.add_argument(
         "-x",
-        "--torch_ig_fn",
-        type=str,
-        help="Input generation function name for passed PyTorch function (assumed as get_inputs).",
-    )
-    parser.add_argument(
-        "-y",
         "--jax_ig_fn",
         type=str,
         help="Input generation function name for passed JAX function (assumed as get_inputs).",
     )
     parser.add_argument(
-        "-d",
-        "--debug",
+        "-v",
+        "--verbose",
         action="store_true",
-        help="Debug flag for debugging file loading.",
+        help="Toggle verbose console output.",
     )
     parser.add_argument(
         "-s", "--save", action="store_true", help="Save dumped XLA after parsing."
@@ -118,69 +100,20 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    debug = args.debug
-
-    if args.torch_file:
-        function_name = args.torch_fn if args.torch_fn else "kernel"
-        fn = load_function_from_file(args.torch_file, function_name)
-
-        input_function_name = args.torch_ig_fn if args.torch_ig_fn else "get_inputs"
-
-        try:
-            get_inputs = load_function_from_file(args.torch_file, input_function_name)
-        except Exception:
-            raise RuntimeException(
-                "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
-            )
-        # safety in case the target file does not do this already
-        torch.set_default_device("cuda")
-        if debug:
-            print("CUDA available (torch):", torch.cuda.is_available())
-            print("Current CUDA Device (torch):", torch.cuda.current_device())
-
-        # compile the function
-        torch_fn = torch.compile(
-            fn, options={"triton.cudagraphs": True}, fullgraph=True
-        )
-
-        # run the function once before profiling to be safe
-        torch_fn(*(get_inputs()))
-        torch.cuda.synchronize()
-
-        with profile(
-            activities=[ProfilerActivity.CUDA],
-            record_shapes=False,
-            profile_memory=False,
-            acc_events=True,
-        ) as prof:
-            # unpack the inputs into the function input
-            torch_fn(*(get_inputs()))
-            torch.cuda.synchronize()
-
-        # for whatever reason, prof is not garbage collected after the end
-        # of the above with clause and INTENDS for you to use it this way.
-        # events are not recorded properly unless you are at a lower
-        # indentation level... (mind-boggling)
-        num_kernel_launches = sum(e.name == "cudaLaunchKernel" for e in prof.events())
-        if debug:
-            print(f"PyTorch kernel launches: {num_kernel_launches}")
+    debug: bool = args.verbose
 
     if args.jax_file:
         dump_dir.mkdir(parents=True, exist_ok=True)
         assert dump_dir.is_dir() and os.access(dump_dir, os.W_OK)
 
+        # default function name is kernel
         function_name = args.jax_fn if args.jax_fn else "kernel"
         fn = load_function_from_file(args.jax_file, function_name)
 
+        # default input function name is get_inputs
         input_function_name = args.jax_ig_fn if args.jax_ig_fn else "get_inputs"
+        get_inputs = load_function_from_file(args.jax_file, input_function_name)
 
-        try:
-            get_inputs = load_function_from_file(args.jax_file, input_function_name)
-        except _:
-            raise RuntimeException(
-                "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
-            )
         if debug:
             print(
                 "CUDA available (JAX):", any(d.platform == "gpu" for d in jax.devices())
@@ -195,33 +128,14 @@ if __name__ == "__main__":
         if debug:
             print(f"Now searching {dump_dir}")
             print(f"Searching for pattern startswith(jit_{function_name})")
+
         dumps = [
             dump_dir / Path(d)
             for d in os.listdir(dump_dir)
             if d.startswith(f"jit_{function_name}")
         ]
 
-
-        stats = gather_stats(dumps, debug=True)
-
-        if num_kernel_launches:
-            for stat_list in stats:
-                for stat in stat_list:
-                    asdf = get_asdf(stat, num_kernel_launches)
-                    stat.torch_asdf = asdf
-                    if debug:
-                        print("ASDF (vs. PyTorch):", asdf)
-
-        if args.output:
-            for stat_list in stats:
-                for stat in stat_list:
-                    if args.output.is_file():
-                        with open(args.output, "a") as f:
-                            f.write(serialize_stats(stat, os.path.basename(args.jax_file), ";") + "\n")
-                    else:
-                        with open(args.output, "a") as f:
-                            f.write(get_csv_header() + "\n")
-                            f.write(serialize_stats(stat, ";") + "\n")
+        stats = opt_compare(dumps, debug=True)
 
         if not args.save:
             recursive_deletion(dump_dir)
