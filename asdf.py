@@ -78,7 +78,7 @@ if __name__ == "__main__":
         "-f",
         "--torch_fn",
         type=str,
-        help="Name of function to load from provided PyTorch file.",
+        help="Name of function to load from provided PyTorch file (assumed as 'kernel' unless otherwise specified).",
     )
     parser.add_argument(
         "-j",
@@ -90,7 +90,7 @@ if __name__ == "__main__":
         "-g",
         "--jax_fn",
         type=str,
-        help="Name of function to load from provided JAX file.",
+        help="Name of function to load from provided JAX file (assumed as 'kernel' unless otherwise specified).",
     )
     parser.add_argument(
         "-x",
@@ -122,14 +122,14 @@ if __name__ == "__main__":
     debug = args.debug
 
     if args.torch_file:
-        function_name = args.torch_fn if args.torch_fn else "main"
+        function_name = args.torch_fn if args.torch_fn else "kernel"
         fn = load_function_from_file(args.torch_file, function_name)
 
         input_function_name = args.torch_ig_fn if args.torch_ig_fn else "get_inputs"
 
         try:
             get_inputs = load_function_from_file(args.torch_file, input_function_name)
-        except _:
+        except Exception:
             raise RuntimeException(
                 "Must define a function 'get_inputs' which returns the inputs of the profiled function as a tuple."
             )
@@ -170,7 +170,7 @@ if __name__ == "__main__":
         dump_dir.mkdir(parents=True, exist_ok=True)
         assert dump_dir.is_dir() and os.access(dump_dir, os.W_OK)
 
-        function_name = args.jax_fn if args.jax_fn else "main"
+        function_name = args.jax_fn if args.jax_fn else "kernel"
         fn = load_function_from_file(args.jax_file, function_name)
 
         input_function_name = args.jax_ig_fn if args.jax_ig_fn else "get_inputs"
@@ -192,11 +192,15 @@ if __name__ == "__main__":
 
         # run the function to dump XLA compilation at the lowest level
         jax_fn(*(get_inputs())).block_until_ready()
+        if debug:
+            print(f"Now searching {dump_dir}")
+            print(f"Searching for pattern startswith(jit_{function_name})")
         dumps = [
             dump_dir / Path(d)
             for d in os.listdir(dump_dir)
-            if d.startswith(f"jit_{args.jax_fn}")
+            if d.startswith(f"jit_{function_name}")
         ]
+
 
         stats = gather_stats(dumps, debug=True)
 
@@ -222,4 +226,7 @@ if __name__ == "__main__":
         if not args.save:
             recursive_deletion(dump_dir)
         else:
-            os.rename(os.path.basename(dump_dir), f"saved_asdf_{args.jax_fn}_{PID}")
+            name = os.path.basename(args.jax_file).split(".")[0]
+            os.rename(os.path.basename(dump_dir),
+                      f"saved_asdf_{name}_{function_name}_{PID}")
+            print(f"Saved MLIR to ./saved_asdf_{name}_{function_name}_{PID}/")

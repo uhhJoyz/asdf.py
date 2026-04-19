@@ -274,6 +274,7 @@ def parse_mlir_file(path: Path) -> list[FunctionStats]:
 def get_stats(dir: Path) -> list[FunctionStats]:
     stats_list = parse_mlir_file(dir / "module.mlir")
     callee_names = {c for s in stats_list for c in s.external_calls}
+    print("\t\t\tcallee names", callee_names)
     return [s for s in stats_list if s.name not in callee_names]
 
 
@@ -301,6 +302,8 @@ def fmt_operations(n: int) -> str:
 
 def gather_stats(dirs: list[Path], debug: bool = True):
     stats: list[FunctionStats] = []
+    if debug:
+        print(f"Gathering stats for directories: {dirs}")
     for dir in dirs:
         all_stats: list[FunctionStats] = get_stats(dir)
         stats.append(all_stats)
