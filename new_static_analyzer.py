@@ -171,7 +171,7 @@ class FunctionStats:
     compute_ops: int = 0
     external_calls: list[str] = field(default_factory=list)
     unique_ops: int = 0
-    p_a_int: float = 0
+    arith_int: float = 0
     asdf: float = 0
     torch_asdf: float = 0
 
@@ -190,7 +190,7 @@ class KernelStats:
         return self.input_bytes + self.output_bytes
 
     @property
-    def p_a_int(self) -> float:
+    def arith_int(self) -> float:
         return self.compute_ops / self.mem_bytes if self.mem_bytes > 0 else 0.0
 
 
@@ -209,7 +209,7 @@ class StageStats:
         return sum(k.mem_bytes for k in self.kernels)
 
     @property
-    def overall_p_a_int(self) -> float:
+    def overall_arith_int(self) -> float:
         return (
             self.total_compute_ops / self.total_mem_bytes
             if self.total_mem_bytes > 0
@@ -219,7 +219,7 @@ class StageStats:
     def serialize(self, name: str, output_file: Path, delim: str = ";"):
         return (
             f"{name}{delim}{os.path.basename(self.path)}{delim}"
-            + f"{self.overall_p_a_int}{delim}"
+            + f"{self.overall_arith_int}{delim}"
         )
         
 
@@ -235,8 +235,9 @@ def serialize_stats(fs: FunctionStats, file: str | Path = "", sep: str = ";") ->
         f"{fs.compute_ops}{sep}"
         f"{fs.external_calls}{sep}"
         f"{fs.unique_ops}{sep}"
-        f"{round(fs.p_a_int, 4)}{sep}"
+        f"{round(fs.arith_int, 4)}{sep}"
         f"{round(fs.asdf, 4)}{sep}"
+        f"{round(fs.torch_asdf, 4)}"
     )
 
 
@@ -252,8 +253,9 @@ def get_csv_header(sep: str = ";"):
         f"Compute Operations{sep}"
         f"External Calls{sep}"
         f"Unique Operations in Kernel{sep}"
-        f"Potential Arithmetic Intensity{sep}"
-        f"PASDF"
+        f"Arithmetic Intensity{sep}"
+        f"ASDF{sep}"
+        f"Torch ASDF"
     )
 
 
@@ -338,15 +340,15 @@ def parse_function(ftext: str) -> FunctionStats:
         if not op_m:
             continue
         op = op_m.group(1)
-        unique_ops: dict[str, int] = {op: 0 for op in COMPUTE_OPS}
+        # unique_ops was previously reset inside this loop, causing it to count
+        # op lines rather than accumulate across the function body.  Increment
+        # directly so stats.unique_ops is a simple per-op-occurrence count.
         if op in COMPUTE_OPS:
             all_types = re.findall(r"tensor<[^>]+>", stripped)
-            unique_ops[op] += 1
             if all_types:
                 n, _ = get_tensor_size_and_type(all_types[-1])
                 stats.compute_ops += n
-        for v in unique_ops.values():
-            stats.unique_ops += v
+            stats.unique_ops += 1
 
     return stats
 
@@ -429,12 +431,19 @@ def gather_stats(dirs: list[Path], debug: bool = True):
                     print(f"Bytes written to HBM: {fmt_bytes(out_b)}")
 
                 if fs.mem_bytes > 0 and debug:
-                    fs.p_a_int = fs.compute_ops / fs.mem_bytes
+                    fs.arith_int = fs.compute_ops / fs.mem_bytes
                     # Arithmetic intensity Scaling Due to Fusion, compares to strawman
-                    fs.asdf = fs.unique_ops / fs.p_a_int
+                    fs.asdf = fs.unique_ops / fs.arith_int
                     if debug:
-                        print(f"Potential Arithmetic intensity: {fs.p_a_int:.6f}")
-                        print(f"PASDF (strawman): {fs.asdf}")
+                        print(f"Arithmetic intensity: {fs.arith_int:.6f}")
+                        print(f"ASDF (strawman): {fs.asdf}")
+
+                # NOTE: the below does not properly calculate register pressure
+                # it was WIP, but was abandoned because it is not very useful
+                # if fs.reg_bytes > 0 and debug:
+                #     reg_pressure = fs.reg_bytes / fs.compute_ops
+                #     if debug:
+                #         print("Register pressure:", reg_pressure)
 
         if debug:
             print_stats(dir)
@@ -443,8 +452,8 @@ def gather_stats(dirs: list[Path], debug: bool = True):
 
 def get_asdf(stat: FunctionStats, function_calls: int) -> float:
     ext = len(stat.external_calls) + 1
-    if stat.p_a_int > 0:
-        return (stat.p_a_int / ext) / (stat.p_a_int / function_calls)
+    if stat.arith_int > 0:
+        return (stat.arith_int / ext) / (stat.arith_int / function_calls)
     else:
         return 0
 
@@ -513,7 +522,7 @@ def print_entry_stats(annotation: str, ks: KernelStats):
     print(
         f"flat op {ks.name} ({annotation}): "
         f"in={fmt_bytes(ks.input_bytes)}, out={fmt_bytes(ks.output_bytes)}, "
-        f"ops={ks.compute_ops}, AI={ks.p_a_int:.4f}"
+        f"ops={ks.compute_ops}, AI={ks.arith_int:.4f}"
     )
 
 
@@ -532,6 +541,28 @@ def parse_entry_flat(entry_body: str, debug: bool = False) -> list[KernelStats]:
         n, _ = get_hlo_size_and_type(m.group("type"))
         out_b = type_bytes(m.group("type"))
         in_b = input_bytes_for_args(m.group("args"), ssa)
+
+        # for operations which are not single-element oriented, 
+        # this avoids under-counting the operations
+        if op in ("dot", "dot_general"):
+            lhs_name = re.findall(r"%[\w.]+", m.group("args"))[0].lstrip("%")
+            lhs_type = ssa.get(lhs_name, "")
+            lhs_dims_m = re.match(r"\w+\[([^\]]+)\]", lhs_type)
+            contract_m = re.search(r"lhs_contracting_dims=\{([^}]+)\}", line)
+            if lhs_dims_m and contract_m:
+                lhs_dims = [int(x) for x in lhs_dims_m.group(1).split(",")]
+                contract_idx = int(contract_m.group(1).split(",")[0])
+                n *= lhs_dims[contract_idx]
+        elif op == "reduce":
+            input_name = re.findall(r"%[\w.]", m.group("args"))[0].lstrip("%")
+            input_type = ssa.get(input_name, "")
+            input_dims_m = re.match(r"\w+\[([^\]]+)\]", input_type)
+            dims_m = re.search(r"dimensions=\{([^}]+)\}", line)
+            if input_dims_m and dims_m:
+                input_dims = [int(x) for x in input_dims_m.group(1).split(",")]
+                reduced = [int(i.strip()) for i in dims_m.group(1).split(",")]
+                for i in reduced:
+                    n *= input_dims[i]
 
         ks = KernelStats(
             name=m.group("name"),
@@ -665,14 +696,14 @@ def print_stage_comparison(stage_stats: list[StageStats]):
         print(f"Num Kernels: {len(ss.kernels)}")
         print(f"Total Compute Ops: {fmt_operations(ss.total_compute_ops)}")
         print(f"Total Mem Bytes: {fmt_bytes(ss.total_mem_bytes)}")
-        print(f"Overall Potential Arithmetic Intensity: {ss.overall_p_a_int:.4f} ops/byte")
+        print(f"Overall Arithmetic Intensity: {ss.overall_arith_int:.4f} ops/byte")
 
         for k in ss.kernels:
             print(
                 f"\t[{k.kind:8s}] {k.name}: "
                 + f"ops={fmt_operations(k.compute_ops)} "
                 + f"mem={fmt_bytes(k.mem_bytes)} "
-                + f"paint={k.p_a_int:.4f}"
+                + f"aint={k.arith_int:.4f}"
             )
             if k.op_counts:
                 print(f"\t\tops in kernel: {sorted(k.op_counts)}")
@@ -687,12 +718,12 @@ def print_stage_comparison(stage_stats: list[StageStats]):
             f"Virtual Kernel Count: {len(before.kernels):4d} -> {len(after.kernels):4d}"
         )
         print(
-            f"Overall Potential Arithmetic Intensity (ops/byte): {before.overall_p_a_int:.4f} -> {after.overall_p_a_int:.4f}"
+            f"Overall Arithmetic Intensity (ops/byte): {before.overall_arith_int:.4f} -> {after.overall_arith_int:.4f}"
         )
 
-        if before.overall_p_a_int > 0:
-            ratio = after.overall_p_a_int / before.overall_p_a_int
-            print(f"PASDF: {ratio:.3f}x")
+        if before.overall_arith_int > 0:
+            ratio = after.overall_arith_int / before.overall_arith_int
+            print(f"ASDF: {ratio:.3f}x")
     else:
         if not before:
             print("before_optimizations stage not found")
