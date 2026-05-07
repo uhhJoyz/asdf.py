@@ -172,8 +172,8 @@ class FunctionStats:
     external_calls: list[str] = field(default_factory=list)
     unique_ops: int = 0
     p_a_int: float = 0
-    asdf: float = 0
-    torch_asdf: float = 0
+    fig: float = 0
+    torch_fig: float = 0
 
 
 @dataclass
@@ -236,7 +236,7 @@ def serialize_stats(fs: FunctionStats, file: str | Path = "", sep: str = ";") ->
         f"{fs.external_calls}{sep}"
         f"{fs.unique_ops}{sep}"
         f"{round(fs.p_a_int, 4)}{sep}"
-        f"{round(fs.asdf, 4)}{sep}"
+        f"{round(fs.fig, 4)}{sep}"
     )
 
 
@@ -252,8 +252,8 @@ def get_csv_header(sep: str = ";"):
         f"Compute Operations{sep}"
         f"External Calls{sep}"
         f"Unique Operations in Kernel{sep}"
-        f"Potential Arithmetic Intensity{sep}"
-        f"PASDF"
+        f"Fusion Intensity{sep}"
+        f"FIG"
     )
 
 
@@ -430,18 +430,17 @@ def gather_stats(dirs: list[Path], debug: bool = True):
 
                 if fs.mem_bytes > 0 and debug:
                     fs.p_a_int = fs.compute_ops / fs.mem_bytes
-                    # Arithmetic intensity Scaling Due to Fusion, compares to strawman
-                    fs.asdf = fs.unique_ops / fs.p_a_int
+                    fs.fig = fs.unique_ops / fs.p_a_int
                     if debug:
-                        print(f"Potential Arithmetic intensity: {fs.p_a_int:.6f}")
-                        print(f"PASDF (strawman): {fs.asdf}")
+                        print(f"Fusion Intensity: {fs.p_a_int:.6f}")
+                        print(f"FIG (strawman): {fs.fig}")
 
         if debug:
             print_stats(dir)
     return stats
 
 
-def get_asdf(stat: FunctionStats, function_calls: int) -> float:
+def get_fig(stat: FunctionStats, function_calls: int) -> float:
     ext = len(stat.external_calls) + 1
     if stat.p_a_int > 0:
         return (stat.p_a_int / ext) / (stat.p_a_int / function_calls)
@@ -692,7 +691,7 @@ def print_stage_comparison(stage_stats: list[StageStats]):
 
         if before.overall_p_a_int > 0:
             ratio = after.overall_p_a_int / before.overall_p_a_int
-            print(f"PASDF: {ratio:.3f}x")
+            print(f"FIG: {ratio:.3f}x")
     else:
         if not before:
             print("before_optimizations stage not found")

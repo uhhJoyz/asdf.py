@@ -27,7 +27,7 @@ import sys
 import torch
 import jax
 from torch.profiler import profile, ProfilerActivity
-from static_analyzer import gather_stats, get_asdf, serialize_stats, get_csv_header, opt_compare
+from static_analyzer import gather_stats, get_fig, serialize_stats, get_csv_header, opt_compare
 
 
 # a helper function to delete files because
@@ -142,5 +142,5 @@ if __name__ == "__main__":
         else:
             name = os.path.basename(args.jax_file).split(".")[0]
             os.rename(os.path.basename(dump_dir),
-                      f"saved_asdf_{name}_{function_name}_{PID}")
-            print(f"Saved MLIR to ./saved_asdf_{name}_{function_name}_{PID}/")
+                      f"saved_fig_{name}_{function_name}_{PID}")
+            print(f"Saved MLIR to ./saved_fig_{name}_{function_name}_{PID}/")
